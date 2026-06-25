@@ -1,0 +1,31 @@
+# Git & Portable Binaries
+.git-portable/
+mingit.zip
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Python Cache & Metadata
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Sensitive Configuration
+.env
+depression_detection/.env
+
+# Large Datasets & Models
+depression_detection/GoogleNews-vectors-negative300.bin
+depression_detection/depressed.json
+depression_detection/normal.json
+depression_detection/reddit_depression_dataset.csv
+depression_detection/outputs/embeddings.npz
+depression_detection/outputs/features.csv
+depression_detection/outputs/reddit_embeddings.npz
+depression_detection/outputs/reddit_features.csv
+depression_detection/daic-woz/
