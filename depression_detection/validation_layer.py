@@ -235,8 +235,8 @@ class MetricSuite:
         precision   = tp / max(tp + fp, eps)
         recall      = tp / max(tp + fn, eps)
         f1          = 2 * precision * recall / max(precision + recall, eps)
-        sensitivity = recall
-        specificity = tn / max(tn + fp, eps)
+        sensitivity = recall if (tp + fn > 0) else float('nan')
+        specificity = tn / max(tn + fp, eps) if (tn + fp > 0) else float('nan')
         mcc_denom   = math.sqrt(max((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn), eps))
         mcc         = (tp * tn - fp * fn) / mcc_denom
         auc_roc     = self._auc_roc(y_true, y_prob)
@@ -245,8 +245,8 @@ class MetricSuite:
             accuracy=round(accuracy, 6),
             f1=round(f1, 6),
             auc_roc=round(auc_roc, 6),
-            sensitivity=round(sensitivity, 6),
-            specificity=round(specificity, 6),
+            sensitivity=sensitivity if math.isnan(sensitivity) else round(sensitivity, 6),
+            specificity=specificity if math.isnan(specificity) else round(specificity, 6),
             mcc=round(mcc, 6),
             support=n,
         )
@@ -340,12 +340,17 @@ class BiasAudit:
                     1 for i, v in enumerate(attr_values) if v == val and y_pred[i] == 1
                 ) / max(subgroup_sizes.get(val, 1), 1)
 
+                if math.isnan(m.sensitivity) or math.isnan(ref_tpr):
+                    eo_gap = float('nan')
+                else:
+                    eo_gap = round(abs(m.sensitivity - ref_tpr), 6)
+
                 results.append(BiasAuditResult(
                     subgroup_name="{}={}".format(attr, val_name),
                     attribute=attr,
                     subgroup_value=val,
                     metrics=m,
-                    equalized_odds_gap=round(abs(m.sensitivity - ref_tpr), 6),
+                    equalized_odds_gap=eo_gap,
                     demographic_parity_gap=round(abs(pos_rate - ref_pos_rate), 6),
                     reference_group="{}={}".format(attr, ref_name),
                 ))
@@ -750,7 +755,7 @@ class ValidationLayer:
         # Also check bias
         if not retrain:
             for b in bias_results:
-                if b.equalized_odds_gap > self.cfg.max_equalized_odds_gap:
+                if not math.isnan(b.equalized_odds_gap) and b.equalized_odds_gap > self.cfg.max_equalized_odds_gap:
                     retrain = True
                     print(
                         "  Retrain triggered by bias: {} EO-gap={:.4f} > {:.4f}".format(
@@ -819,10 +824,11 @@ def format_validation_report(report: ValidationReport, width: int = 68) -> str:
             "| BIAS AUDIT".ljust(width) + " |",
         ]
         for b in report.bias_audit_results:
+            eo_str = "N/A" if math.isnan(b.equalized_odds_gap) else "{:.4f}".format(b.equalized_odds_gap)
             lines.append(
-                "|   {:>24} vs {:>12}  EO-gap={:.4f}  DP-gap={:.4f}".format(
+                "|   {:>24} vs {:>12}  EO-gap={:<6}  DP-gap={:.4f}".format(
                     b.subgroup_name, b.reference_group,
-                    b.equalized_odds_gap, b.demographic_parity_gap,
+                    eo_str, b.demographic_parity_gap,
                 ).ljust(width) + " |"
             )
 

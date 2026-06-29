@@ -226,6 +226,7 @@ class OutputLayer:
         self,
         report: "PatientReport",
         raw_risk: str,
+        reconciled_symptoms: bool = False,
     ) -> str:
         sym_list = ", ".join(report.active_symptoms[:5]) if report.active_symptoms else "None"
         base_notes = (
@@ -238,6 +239,8 @@ class OutputLayer:
         )
         if raw_risk != report.risk_level:
             base_notes += f"Note: Model predicted '{report.prediction_label}' but rule-based severity suggests '{raw_risk}' risk; gated final risk level to '{report.risk_level}'. "
+        if reconciled_symptoms:
+            base_notes += "Note: Severity indicates high clinical risk but no symptoms originally exceeded threshold; top-probability symptoms promoted for clinical consistency. "
         
         base_notes += "NOTE: This is an AI decision-support tool; clinical judgement must override."
         return base_notes
@@ -294,6 +297,17 @@ class OutputLayer:
             if prob >= self.symptom_threshold
         ]
 
+        # Reconcile severity and symptom count inconsistency
+        reconciled_symptoms = False
+        if sev_score >= 15.0 and len(active_symptoms) == 0:
+            # Find the top predicted symptoms to reconcile the severe index
+            sorted_syms = sorted(symptom_scores.items(), key=lambda x: -x[1])
+            # Select symptoms with non-zero probability (or top 3 if all are equal)
+            active_symptoms = [name for name, prob in sorted_syms[:3] if prob > 0.0]
+            if not active_symptoms:
+                active_symptoms = [name for name, prob in sorted_syms[:3]]
+            reconciled_symptoms = True
+
         # --- Fusion gate weights ---
         fusion_w = model_output["fusion_weights"][i].detach().cpu().tolist()
         fusion_gate_weights: Dict[str, float] = {}
@@ -342,7 +356,7 @@ class OutputLayer:
         )
         partial.recommended_action = self._recommended_action(risk, pred_label, active_symptoms, raw_risk, sev_score)
         partial.follow_up_priority = self._follow_up_priority(risk, active_symptoms, raw_risk)
-        partial.clinical_notes     = self._clinical_notes(partial, raw_risk)
+        partial.clinical_notes     = self._clinical_notes(partial, raw_risk, reconciled_symptoms)
         return partial
 
     # ------------------------------------------------------------------
