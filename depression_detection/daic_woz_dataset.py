@@ -283,7 +283,11 @@ class DAICWOZDataset(Dataset):
         pid    = str(int(float(row["participant_id"])))
         label  = int(float(row.get("label", 0)))
         phq    = float(row.get("phq_score", 10 * label))
-        folder = os.path.join(self.cfg.raw_dir, "{}_P".format(pid))
+
+        # ── Resolve file layout ───────────────────────────────────────────────
+        # Layout A (subfolder): raw_dir/{pid}_P/{pid}_COVAREP.csv  (3 pre-unzipped)
+        # Layout B (flat):      raw_dir/{pid}_COVAREP.csv          (Expand-Archive flat)
+        folder = self._resolve_folder(pid)
 
         # ── Real modalities ───────────────────────────────────────────────────
         audio = self._load_covarep(
@@ -322,6 +326,31 @@ class DAICWOZDataset(Dataset):
             "language":       torch.tensor([1], dtype=torch.long),       # English = 1
             "culture":        torch.tensor([1], dtype=torch.long),
         }
+
+    # ------------------------------------------------------------------
+    # Layout resolver
+    # ------------------------------------------------------------------
+
+    def _resolve_folder(self, pid: str) -> str:
+        """Return the directory that contains {pid}_COVAREP.csv.
+
+        Handles two layouts produced by different extraction methods:
+
+        Layout A — subfolder (pre-extracted zips or manual unzip):
+            raw_dir/{pid}_P/{pid}_COVAREP.csv
+
+        Layout B — flat (PowerShell Expand-Archive to raw_dir directly):
+            raw_dir/{pid}_COVAREP.csv
+
+        Tries Layout A first; falls back to Layout B (raw_dir itself).
+        """
+        subfolder = os.path.join(self.cfg.raw_dir, "{}_P".format(pid))
+        if os.path.isdir(subfolder):
+            covarep_sub = os.path.join(subfolder, "{}_COVAREP.csv".format(pid))
+            if os.path.exists(covarep_sub):
+                return subfolder   # Layout A
+        # Layout B: files flat in raw_dir
+        return self.cfg.raw_dir
 
     # ------------------------------------------------------------------
     # Modality loaders

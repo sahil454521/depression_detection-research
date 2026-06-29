@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -16,6 +16,15 @@ class PredictionConfig:
     binary_weight: float = 1.0
     severity_weight: float = 1.0
     symptom_weight: float = 0.5
+    class_weights: Optional[List[float]] = None
+    """Per-class loss weights [w_normal, w_depressed] to counter class imbalance.
+
+    Computed automatically in pipeline.py from the training split as:
+        w_c = total_samples / (num_classes * count_c)
+
+    For a 4:1 normal/depressed imbalance this is typically [0.62, 2.48].
+    Passing None keeps the default uniform weighting (equivalent to [1, 1]).
+    """
 
 
 class BinaryClassifier(nn.Module):
@@ -89,9 +98,19 @@ def compute_prediction_losses(
     config: Optional[PredictionConfig] = None,
 ) -> torch.Tensor:
     cfg = config or PredictionConfig()
+
+    # Build per-class weight tensor if provided (addresses label imbalance).
+    ce_weight: Optional[torch.Tensor] = None
+    if cfg.class_weights is not None:
+        ce_weight = torch.tensor(
+            cfg.class_weights, dtype=torch.float32,
+            device=outputs["binary_logits"].device,
+        )
+
     binary_loss = F.cross_entropy(
         outputs["binary_logits"],
         targets["label"].long().view(-1),
+        weight=ce_weight,
     )
     severity_loss = F.mse_loss(
         outputs["severity"].view(-1),

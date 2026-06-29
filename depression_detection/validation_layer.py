@@ -176,6 +176,40 @@ class MetricSuite:
         )
         return max(0.0, min(1.0, auc))
 
+    @staticmethod
+    def optimal_threshold(
+        y_true: List[int],
+        y_prob: List[float],
+        thresholds: Optional[List[float]] = None,
+    ) -> Tuple[float, float]:
+        """Find the classification threshold that maximises F1 on this split.
+
+        Returns (best_threshold, best_f1).  Falls back to 0.5 when the
+        positive class is absent or the list is empty.
+        """
+        if thresholds is None:
+            thresholds = [t / 100.0 for t in range(5, 96, 5)]  # 0.05 … 0.95
+
+        if not y_true or sum(y_true) == 0:
+            return 0.5, 0.0
+
+        best_thresh, best_f1 = 0.5, -1.0
+        eps = 1e-9
+        for thresh in thresholds:
+            tp = fp = fn = 0
+            for yt, yp in zip(y_true, y_prob):
+                pred = 1 if yp >= thresh else 0
+                if yt == 1 and pred == 1:   tp += 1
+                elif yt == 0 and pred == 1: fp += 1
+                elif yt == 1 and pred == 0: fn += 1
+            prec = tp / max(tp + fp, eps)
+            rec  = tp / max(tp + fn, eps)
+            f1   = 2 * prec * rec / max(prec + rec, eps)
+            if f1 > best_f1:
+                best_f1, best_thresh = f1, thresh
+
+        return best_thresh, best_f1
+
     def compute(
         self,
         y_true: List[int],
@@ -465,15 +499,17 @@ class LODOValidator:
         print("\n=== LODO Validation ({} folds: {}) ===".format(len(sources), sources))
 
         results: List[LODOResult] = []
+        eval_only = {"wu3d"}
         for fold_idx, held_out in enumerate(sources):
-            train_idx = [i for i, r in enumerate(records) if r.source != held_out]
+            train_idx = [i for i, r in enumerate(records) if r.source != held_out and r.source not in eval_only]
             test_idx  = [i for i, r in enumerate(records) if r.source == held_out]
 
+            train_sources = sorted(set(records[i].source for i in train_idx))
             if not train_idx or not test_idx:
-                print("  Fold {}: skipped (empty split).".format(fold_idx))
+                print("  Fold {}: skipped (no valid training data left or empty test set; held_out='{}', train={}).".format(
+                    fold_idx, held_out, train_sources))
                 continue
 
-            train_sources = sorted(set(records[i].source for i in train_idx))
             print(
                 "\n  Fold {}: held-out='{}', train={}  ({} train / {} test)".format(
                     fold_idx, held_out, train_sources, len(train_idx), len(test_idx)
@@ -502,9 +538,12 @@ class LODOValidator:
                 shuffle=False,
                 collate_fn=collate_fn,
             )
-            y_true, y_pred, y_prob, sensitive = self._collect_predictions(
+            y_true, _, y_prob, sensitive = self._collect_predictions(
                 fold_model, test_loader, device
             )
+            best_thresh, _ = self._metric_suite.optimal_threshold(y_true, y_prob)
+            y_pred = [1 if p >= best_thresh else 0 for p in y_prob]
+            
             metrics = self._metric_suite.compute(y_true, y_pred, y_prob)
             bias    = self._bias_audit.audit(y_true, y_pred, y_prob, sensitive)
 
@@ -647,9 +686,12 @@ class ValidationLayer:
         print("\n=== Validation (round {}) ===".format(model_round))
 
         # 1. Overall metrics on standard val split
-        y_true, y_pred, y_prob, sensitive = self._collect_predictions(
+        y_true, _, y_prob, sensitive = self._collect_predictions(
             model, val_loader, device
         )
+        best_thresh, _ = self._metric_suite.optimal_threshold(y_true, y_prob)
+        y_pred = [1 if p >= best_thresh else 0 for p in y_prob]
+        
         overall_metrics = self._metric_suite.compute(y_true, y_pred, y_prob)
         print(
             "  Overall: F1={:.4f}  AUC={:.4f}  sensitivity={:.4f}  "

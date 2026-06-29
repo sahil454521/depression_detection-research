@@ -151,25 +151,50 @@ class OutputLayer:
                 return label
         return "Severe"
 
-    def _risk_level(self, prob_depressed: float, severity: float) -> str:
-        """Combine probability and severity into a 3-tier risk level."""
+    def _risk_level(self, prob_depressed: float, severity: float, prediction_label: str) -> Tuple[str, str]:
+        """Combine probability and severity into a 3-tier risk level, gated by model prediction."""
         if prob_depressed >= 0.80 or severity >= 20:
-            return "High"
-        if prob_depressed >= 0.50 or severity >= 10:
-            return "Moderate"
-        return "Low"
+            raw_risk = "High"
+        elif prob_depressed >= 0.50 or severity >= 10:
+            raw_risk = "Moderate"
+        else:
+            raw_risk = "Low"
+
+        # Gate on model output to avoid contradiction
+        if prediction_label == "Normal":
+            # If the model predicts Normal, we gate the risk to at most "Moderate"
+            if raw_risk == "High":
+                gated_risk = "Moderate"
+            else:
+                gated_risk = raw_risk
+        else:
+            # If the model predicts Depressed, we gate the risk to at least "Moderate"
+            if raw_risk == "Low":
+                gated_risk = "Moderate"
+            else:
+                gated_risk = raw_risk
+
+        return gated_risk, raw_risk
 
     def _recommended_action(
         self,
         risk: str,
         prediction_label: str,
         active_symptoms: List[str],
+        raw_risk: Optional[str] = None,
+        severity_score: Optional[float] = None,
     ) -> str:
         if "Suicidal Ideation" in active_symptoms or "Self-Harm Ideation" in active_symptoms:
             return (
                 "IMMEDIATE psychiatric evaluation required. "
                 "Suicidal/self-harm ideation detected. Contact crisis services."
             )
+        
+        # Check for gating discrepancy where clinical severity is High (Severe) but model predicts Normal
+        if raw_risk == "High" and risk == "Moderate" and prediction_label == "Normal":
+            category = self._phq9_category(severity_score) if severity_score is not None else "Severe"
+            return f"Model predicts Normal; clinical severity indicators are {category}. Clinician review recommended before de-escalation."
+
         if risk == "High" and prediction_label == "Depressed":
             return "Urgent psychiatric consultation (within 24-48 hours). Consider immediate support services."
         if risk == "Moderate" and prediction_label == "Depressed":
@@ -180,30 +205,42 @@ class OutputLayer:
             return "Preventive counselling session within 2 weeks. Monitor risk factors."
         return "Routine wellness monitoring. Next scheduled check-up as planned."
 
-    def _follow_up_priority(self, risk: str, active_symptoms: List[str]) -> str:
+    def _follow_up_priority(self, risk: str, active_symptoms: List[str], raw_risk: Optional[str] = None) -> str:
         critical = {"Suicidal Ideation", "Self-Harm Ideation"}
         if critical.intersection(active_symptoms):
             return "Urgent"
-        if risk == "High":
+        
+        # Take the maximum of gated and raw risk to determine priority
+        risk_hierarchy = {"High": 3, "Moderate": 2, "Low": 1}
+        gated_val = risk_hierarchy.get(risk, 0)
+        raw_val = risk_hierarchy.get(raw_risk, 0) if raw_risk is not None else 0
+        effective_risk = risk if gated_val >= raw_val else raw_risk
+
+        if effective_risk == "High":
             return "Urgent"
-        if risk == "Moderate":
+        if effective_risk == "Moderate":
             return "Soon"
         return "Routine"
 
     def _clinical_notes(
         self,
         report: "PatientReport",
+        raw_risk: str,
     ) -> str:
         sym_list = ", ".join(report.active_symptoms[:5]) if report.active_symptoms else "None"
-        return (
+        base_notes = (
             f"AI-assisted screening result [{report.timestamp}]. "
             f"Prediction: {report.prediction_label} (confidence {report.confidence:.1%}). "
             f"PHQ-9 proxy: {report.severity_score:.1f} ({report.severity_category}). "
             f"Active DSM-5 symptoms: {sym_list}. "
             f"Primary modality driving prediction: {report.top_modality}. "
             f"Data source: {report.data_source}. "
-            "NOTE: This is an AI decision-support tool; clinical judgement must override."
         )
+        if raw_risk != report.risk_level:
+            base_notes += f"Note: Model predicted '{report.prediction_label}' but rule-based severity suggests '{raw_risk}' risk; gated final risk level to '{report.risk_level}'. "
+        
+        base_notes += "NOTE: This is an AI decision-support tool; clinical judgement must override."
+        return base_notes
 
     # ------------------------------------------------------------------
     # Public API
@@ -279,7 +316,7 @@ class OutputLayer:
             top_feats = list(fusion_gate_weights.items())[:5]
 
         # --- Risk + actions ---
-        risk = self._risk_level(float(binary_probs[1].item()), sev_score)
+        risk, raw_risk = self._risk_level(float(binary_probs[1].item()), sev_score, pred_label)
 
         # Partial report to pass into _clinical_notes
         partial = PatientReport(
@@ -303,9 +340,9 @@ class OutputLayer:
             clinical_notes="",
             data_source=data_source,
         )
-        partial.recommended_action = self._recommended_action(risk, pred_label, active_symptoms)
-        partial.follow_up_priority = self._follow_up_priority(risk, active_symptoms)
-        partial.clinical_notes     = self._clinical_notes(partial)
+        partial.recommended_action = self._recommended_action(risk, pred_label, active_symptoms, raw_risk, sev_score)
+        partial.follow_up_priority = self._follow_up_priority(risk, active_symptoms, raw_risk)
+        partial.clinical_notes     = self._clinical_notes(partial, raw_risk)
         return partial
 
     # ------------------------------------------------------------------

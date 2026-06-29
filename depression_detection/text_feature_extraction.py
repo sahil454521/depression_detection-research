@@ -17,7 +17,7 @@ import unicodedata
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -108,6 +108,20 @@ def read_texts_json(
     texts: List[str] = []
     rows: List[Dict[str, str]] = []
 
+    # Keys tried in order at the TOP level of each item; first non-empty wins.
+    # Deduplicated so text_key doesn't appear twice when it equals a fallback.
+    _seen: set = set()
+    _FALLBACK_KEYS: tuple = tuple(
+        k for k in (text_key, "text", "content", "post", "body",
+                    "tweet_content", "message", "sentence", "description")
+        if not (_seen.add(k) or k in _seen - {k})  # preserve order, no dupes
+    )
+
+    # Keys that may hold a *list of tweet/post dicts* one level down.
+    _NESTED_LIST_KEYS = ("tweets", "posts", "weibo", "messages", "entries", "items")
+    # Text keys tried inside each nested dict.
+    _NESTED_TEXT_KEYS = ("tweet_content", "text", "content", "body", "post", "message")
+
     for label, path in [("depressed", depressed_path), ("normal", normal_path)]:
         if not os.path.exists(path):
             warnings.warn(f"File not found: {path}", UserWarning)
@@ -115,24 +129,98 @@ def read_texts_json(
 
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        text = item.get(text_key, "")
-                    else:
-                        text = str(item)
-                    if text.strip():
-                        texts.append(text)
-                        rows.append({"text": text, "label": label})
+
+        def _extract_text(item) -> str:
+            """Return the concatenated text for one item (user / post).
+
+            Strategy:
+              1. Try each top-level text key directly.
+              2. Scan every value that is a list: if its elements are plain
+                 strings, join them; if they are dicts, recurse with
+                 _NESTED_TEXT_KEYS (handles WU3D user→tweets→tweet_content).
+              3. Return "" if nothing is found.
+            """
+            if not isinstance(item, dict):
+                return str(item)
+
+            # ── pass 1: direct text keys ────────────────────────────────
+            for k in _FALLBACK_KEYS:
+                val = item.get(k)
+                if val is None:
+                    continue
+                if isinstance(val, str) and val.strip():
+                    return val
+                if isinstance(val, list):
+                    joined = " ".join(str(v) for v in val if v)
+                    if joined.strip():
+                        return joined
+
+            # ── pass 2: nested list of dicts (e.g. WU3D tweets list) ───
+            # Try known list-key names first, then fall back to any list value.
+            candidate_lists = []
+            for k in _NESTED_LIST_KEYS:
+                val = item.get(k)
+                if isinstance(val, list) and val:
+                    candidate_lists.append(val)
+            # Also include any other list-of-dicts values not already covered.
+            for k, val in item.items():
+                if k not in _NESTED_LIST_KEYS and isinstance(val, list) and val:
+                    candidate_lists.append(val)
+
+            for lst in candidate_lists:
+                parts = []
+                for element in lst:
+                    if isinstance(element, str) and element.strip():
+                        parts.append(element)
+                    elif isinstance(element, dict):
+                        for tk in _NESTED_TEXT_KEYS:
+                            nested_val = element.get(tk, "")
+                            if isinstance(nested_val, str) and nested_val.strip():
+                                parts.append(nested_val)
+                                break
+                if parts:
+                    return " ".join(parts)
+
+            return ""
+
+        if isinstance(data, list):
+            for item in data:
+                text = _extract_text(item)
+                if text.strip():
+                    texts.append(text)
+                    rows.append({"text": text, "label": label})
+        elif isinstance(data, dict):
+            for key, item in data.items():
+                text = _extract_text(item)
+                if text.strip():
+                    texts.append(text)
+                    rows.append({"text": text, "label": label, "id": key})
+
+        if not texts:
+            # Show ALL keys from the first item so the user can identify the
+            # right one without having to re-run just to see more keys.
+            sample_keys: list = []
+            nested_preview: dict = {}
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                sample_keys = list(data[0].keys())
+                # Show keys inside the first list-of-dicts child too.
+                for k, v in data[0].items():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        nested_preview[k] = list(v[0].keys())
             elif isinstance(data, dict):
-                for key, item in data.items():
-                    if isinstance(item, dict):
-                        text = item.get(text_key, "")
-                    else:
-                        text = str(item)
-                    if text.strip():
-                        texts.append(text)
-                        rows.append({"text": text, "label": label, "id": key})
+                first_val = next(iter(data.values()), None)
+                if isinstance(first_val, dict):
+                    sample_keys = list(first_val.keys())
+            hint = f"Actual top-level keys in first item: {sample_keys}."
+            if nested_preview:
+                hint += f" Nested keys: {nested_preview}."
+            warnings.warn(
+                f"No texts extracted from '{path}' with text_key={text_key!r}. "
+                f"Tried top-level fallbacks {list(_FALLBACK_KEYS)} and nested-list "
+                f"keys {list(_NESTED_LIST_KEYS)} → {list(_NESTED_TEXT_KEYS)}. "
+                f"{hint} Pass the correct key via --text_key.",
+                UserWarning,
+            )
 
     return texts, rows
 
@@ -342,16 +430,62 @@ def compute_sentiment(texts: List[str]) -> Dict[str, List[float]]:
 
 
 def compute_lda_topics(texts: List[str], num_topics: int) -> np.ndarray:
+    """Fit LDA and return topic-probability matrix [n_texts, num_topics].
+
+    Handles edge cases:
+    - Empty texts list → zero matrix of shape (0, num_topics)
+    - Texts that reduce to stop-words only → zero matrix with a warning
+    - Corpus smaller than num_topics → caps n_components to n_docs - 1
+    - Small corpus → lowers min_df so the vocabulary is non-empty
+    """
+    if not texts:
+        return np.zeros((0, num_topics), dtype=np.float64)
+
     normalized_texts = [normalize_text(text) for text in texts]
+
+    # min_df must be ≤ number of documents; scale down for small corpora.
+    n_docs = len(normalized_texts)
+    min_df = min(5, max(1, n_docs // 10))
+
+    # LDA requires num_topics ≤ n_docs.
+    n_components = min(num_topics, max(1, n_docs - 1))
+    if n_components < num_topics:
+        warnings.warn(
+            f"Only {n_docs} document(s) available; reducing LDA n_components "
+            f"from {num_topics} to {n_components}.",
+            UserWarning,
+        )
+
     vectorizer = CountVectorizer(
         max_features=5000,
         stop_words="english",
         ngram_range=(1, 2),
-        min_df=5,
+        min_df=min_df,
     )
-    counts = vectorizer.fit_transform(normalized_texts)
-    lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
-    return lda.fit_transform(counts)
+    try:
+        counts = vectorizer.fit_transform(normalized_texts)
+    except ValueError as exc:
+        if "empty vocabulary" in str(exc):
+            warnings.warn(
+                f"LDA skipped: vocabulary is empty after stop-word filtering "
+                f"({n_docs} text(s), min_df={min_df}). "
+                f"This usually means your texts are too short, all stop-words, "
+                f"or the wrong JSON key was used to load text. "
+                f"Returning a zero topic matrix.",
+                UserWarning,
+            )
+            return np.zeros((n_docs, num_topics), dtype=np.float64)
+        raise
+
+    lda = LatentDirichletAllocation(n_components=n_components, random_state=42)
+    topic_probs = lda.fit_transform(counts)          # shape: (n_docs, n_components)
+
+    # Pad columns to always return shape (n_docs, num_topics).
+    if n_components < num_topics:
+        padding = np.zeros((n_docs, num_topics - n_components), dtype=np.float64)
+        topic_probs = np.concatenate([topic_probs, padding], axis=1)
+
+    return topic_probs
 
 
 def compute_dsm5_keyword_counts(texts: List[str]) -> Dict[str, List[int]]:
@@ -369,8 +503,12 @@ def write_features_csv(
     sentiment: Dict[str, List[float]],
     lda: np.ndarray,
     dsm5: Dict[str, List[int]],
+    labels: Optional[List[int]] = None,
 ) -> None:
-    fieldnames = ["row_id"] + list(sentiment.keys())
+    fieldnames = ["row_id"]
+    if labels is not None:
+        fieldnames.append("label")
+    fieldnames += list(sentiment.keys())
     fieldnames += [f"lda_topic_{i}" for i in range(lda.shape[1])]
     fieldnames += list(dsm5.keys())
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -378,6 +516,8 @@ def write_features_csv(
         writer.writeheader()
         for i, row_id in enumerate(row_ids):
             row: Dict[str, float] = {"row_id": row_id}
+            if labels is not None:
+                row["label"] = labels[i]
             for k, v in sentiment.items():
                 row[k] = v[i]
             for j in range(lda.shape[1]):
@@ -477,12 +617,24 @@ def main() -> None:
     print(f"Saving embeddings to {embeddings_path}...")
     write_embeddings_npz(embeddings_path, embeddings)
     print(f"Saving features to {features_path}...")
+    labels = []
+    for r in rows:
+        if dataset_type.lower() == "wu3d":
+            val = 1 if r.get("label") == "depressed" else 0
+        else:
+            try:
+                val = int(r.get("label", 0))
+            except (ValueError, TypeError):
+                val = 0
+        labels.append(val)
+
     write_features_csv(
         features_path,
         row_ids=range(len(texts)),
         sentiment=sentiment,
         lda=lda,
         dsm5=dsm5,
+        labels=labels,
     )
     print("Done!")
 

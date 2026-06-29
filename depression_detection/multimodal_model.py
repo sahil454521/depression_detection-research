@@ -201,8 +201,8 @@ def _load_reddit(csv_path: str) -> List[SampleRecord]:
             if not text:
                 continue
             try:
-                label_int = int(row.get("label", 0))
-            except ValueError:
+                label_int = int(row.get("label") or 0)
+            except (ValueError, TypeError):
                 label_int = 0
             records.append(SampleRecord(text=text, label=label_int, gender=0, source="reddit"))
 

@@ -56,18 +56,37 @@ def _norm_gender(g: str) -> str:
 
 
 def _scan_folders(raw_dir: str) -> list:
-    """Return sorted list of (pid_str, folder_path) for all {pid}_P dirs."""
-    found = []
+    """Return sorted list of (pid_str, folder_path) for all participants.
+
+    Detects two layouts:
+      Layout A -- subfolder:  raw_dir/{pid}_P/   (pre-extracted or manual unzip)
+      Layout B -- flat files: raw_dir/{pid}_COVAREP.csv  (Expand-Archive flat)
+    """
+    found = {}   # pid -> folder
     if not os.path.isdir(raw_dir):
-        return found
-    pat = re.compile(r"^(\d+)_P$")
-    for name in sorted(os.listdir(raw_dir)):
-        m = pat.match(name)
-        if m:
-            folder = os.path.join(raw_dir, name)
-            if os.path.isdir(folder):
-                found.append((m.group(1), folder))
-    return found
+        return []
+
+    pat_dir  = re.compile(r"^(\d+)_P$")
+    pat_file = re.compile(r"^(\d+)_COVAREP\.csv$")
+
+    for name in os.listdir(raw_dir):
+        full = os.path.join(raw_dir, name)
+        # Layout A: {pid}_P directory
+        m = pat_dir.match(name)
+        if m and os.path.isdir(full):
+            pid = m.group(1)
+            if pid not in found:
+                found[pid] = full
+            continue
+        # Layout B: {pid}_COVAREP.csv flat file
+        m = pat_file.match(name)
+        if m and os.path.isfile(full):
+            pid = m.group(1)
+            if pid not in found:
+                found[pid] = raw_dir   # folder = raw_dir itself
+
+    return sorted(found.items(), key=lambda x: int(x[0]))
+
 
 
 def _read_official_csv(path: str, split_name: str) -> dict:

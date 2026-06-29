@@ -32,7 +32,7 @@ import copy
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -91,9 +91,10 @@ class PipelineConfig:
     fl_local_epochs:      int = 2
     fl_local_lr:          float = 1e-3
     fl_global_lr:         float = 1.0
-    fl_epsilon:           float = 1.0
+    fl_epsilon:           Optional[float] = None
     fl_delta:             float = 1e-5
-    fl_clip_norm:         float = 1.0
+    fl_clip_norm:         Union[float, str] = 5.0
+    fl_sigma:             Optional[float] = 1.25
     fl_aggregation:       str = "fedavg"
     fl_secure_aggregation: bool = True
 
@@ -166,9 +167,9 @@ class RetrainLoop:
 
         for attempt in range(self.max_attempts):
             print(
-                "\n{'=' * 60}\n"
-                "RETRAIN LOOP -- attempt {}/{}\n"
-                "{'=' * 60}".format(attempt + 1, self.max_attempts)
+                f"\n{'=' * 60}\n"
+                f"RETRAIN LOOP -- attempt {attempt + 1}/{self.max_attempts}\n"
+                f"{'=' * 60}"
             )
 
             # --- FL training ---
@@ -411,11 +412,26 @@ class DepressionDetectionPipeline:
             val_data, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch
         )
 
+        # ---- 1b. Class Weights ----
+        train_loader_temp = DataLoader(train_data, batch_size=256, shuffle=False, collate_fn=collate_batch)
+        counts = {0: 0, 1: 0}
+        for b in train_loader_temp:
+            for l in b["label"].long().view(-1).tolist():
+                counts[l] += 1
+        total = counts[0] + counts[1]
+        w0 = total / (2.0 * max(counts[0], 1))
+        w1 = total / (2.0 * max(counts[1], 1))
+        class_weights = [w0, w1]
+        print("Class weights injected: Normal={:.4f}, Depressed={:.4f}".format(w0, w1))
+
         # ---- 2. Model ----
         # Use self._ds_cfg (set in _build_dataset) to get architecture parameters.
         # This works whether full_dataset is a RealDepressionDataset or ConcatDataset.
         ds_cfg = getattr(full_dataset, "cfg", self._ds_cfg)
-        prediction_config = PredictionConfig(num_symptoms=ds_cfg.num_symptoms)
+        prediction_config = PredictionConfig(
+            num_symptoms=ds_cfg.num_symptoms,
+            class_weights=class_weights
+        )
         model = self._build_model(ds_cfg, prediction_config)
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print("\nModel trainable parameters: {:,}".format(total_params))
@@ -431,6 +447,7 @@ class DepressionDetectionPipeline:
             epsilon=cfg.fl_epsilon,
             delta=cfg.fl_delta,
             clip_norm=cfg.fl_clip_norm,
+            sigma=cfg.fl_sigma,
             aggregation=cfg.fl_aggregation,
             use_secure_aggregation=cfg.fl_secure_aggregation,
         )
@@ -441,6 +458,7 @@ class DepressionDetectionPipeline:
             collate_fn=collate_batch,
             device=self.device,
             batch_size=cfg.batch_size,
+            train_indices=train_data.indices,
         )
 
         # ---- 4. Validation Layer ----
@@ -547,10 +565,11 @@ if __name__ == "__main__":
     parser.add_argument("--fl_rounds",      type=int,   default=5)
     parser.add_argument("--fl_local_epochs",type=int,   default=2)
     parser.add_argument("--fl_local_lr",    type=float, default=1e-3)
-    parser.add_argument("--fl_epsilon",     type=float, default=1.0,
+    parser.add_argument("--fl_epsilon",     type=float, default=None,
                         help="Differential privacy epsilon (lower = more privacy)")
     parser.add_argument("--fl_delta",       type=float, default=1e-5)
-    parser.add_argument("--fl_clip_norm",   type=float, default=1.0)
+    parser.add_argument("--fl_clip_norm",   type=str,   default="5.0")
+    parser.add_argument("--fl_sigma",       type=float, default=1.25)
     parser.add_argument("--no_secure_agg",  action="store_true",
                         help="Disable secure aggregation (for debugging)")
     # Retrain loop
@@ -588,7 +607,8 @@ if __name__ == "__main__":
         fl_local_lr=args.fl_local_lr,
         fl_epsilon=args.fl_epsilon,
         fl_delta=args.fl_delta,
-        fl_clip_norm=args.fl_clip_norm,
+        fl_clip_norm=float(args.fl_clip_norm) if args.fl_clip_norm != "adaptive" else "adaptive",
+        fl_sigma=args.fl_sigma,
         fl_secure_aggregation=not args.no_secure_agg,
         max_retrain_attempts=args.max_retrain,
         target_f1=args.target_f1,

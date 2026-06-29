@@ -29,3 +29,8 @@ depression_detection/outputs/features.csv
 depression_detection/outputs/reddit_embeddings.npz
 depression_detection/outputs/reddit_features.csv
 depression_detection/daic-woz/
+
+# Generated outputs
+depression_detection/outputs/*.pt
+depression_detection/outputs/*.json
+depression_detection/outputs/plots/

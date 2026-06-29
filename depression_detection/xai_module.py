@@ -164,7 +164,8 @@ class IntegratedGradientsExplainer:
             ]
 
             stacked = torch.stack(interp, dim=1)   # [B, M, D]
-            logits  = logit_fn(stacked)            # [B, 2]
+            with torch.backends.cudnn.flags(enabled=False):
+                logits  = logit_fn(stacked)            # [B, 2]
             score   = logits[:, target_class].sum()
 
             grads = torch.autograd.grad(
@@ -204,7 +205,8 @@ class EEGChannelAttribution:
         score_fn: Callable[[torch.Tensor], torch.Tensor],  # eeg ? [B] or scalar
     ) -> torch.Tensor:                              # [B, C]
         eeg_leaf = eeg.detach().requires_grad_(True)
-        score = score_fn(eeg_leaf)
+        with torch.backends.cudnn.flags(enabled=False):
+            score = score_fn(eeg_leaf)
         if score.dim() > 0:
             score = score.sum()
         grads = torch.autograd.grad(
@@ -241,7 +243,8 @@ class TextSpanAttribution:
         score_fn: Callable[[torch.Tensor], torch.Tensor],   # text_emb ? [B] or scalar
     ) -> torch.Tensor:                                      # [B, D]
         text_leaf = text_emb.detach().requires_grad_(True)
-        score = score_fn(text_leaf)
+        with torch.backends.cudnn.flags(enabled=False):
+            score = score_fn(text_leaf)
         if score.dim() > 0:
             score = score.sum()
         grads = torch.autograd.grad(
@@ -327,7 +330,8 @@ class CounterfactualExplainer:
             perturbed = {k: single[k] + delta_leaves[k] for k in names}
             stacked = torch.stack([perturbed[k] for k in names], dim=1)   # [1, M, D]
 
-            logits = logit_fn(stacked)                                     # [1, 2]
+            with torch.backends.cudnn.flags(enabled=False):
+                logits = logit_fn(stacked)                                     # [1, 2]
             ce     = F.cross_entropy(logits, target)
             prox   = sum(d.pow(2).mean() for d in delta_leaves.values())
             sparse = sum(d.abs().mean()  for d in delta_leaves.values())
