@@ -297,15 +297,19 @@ class OutputLayer:
             if prob >= self.symptom_threshold
         ]
 
+        # Keep a copy of model-detected symptoms for safety rules
+        detected_symptoms = list(active_symptoms)
+
         # Reconcile severity and symptom count inconsistency
         reconciled_symptoms = False
         if sev_score >= 15.0 and len(active_symptoms) == 0:
             # Find the top predicted symptoms to reconcile the severe index
             sorted_syms = sorted(symptom_scores.items(), key=lambda x: -x[1])
             # Select symptoms with non-zero probability (or top 3 if all are equal)
-            active_symptoms = [name for name, prob in sorted_syms[:3] if prob > 0.0]
-            if not active_symptoms:
-                active_symptoms = [name for name, prob in sorted_syms[:3]]
+            promoted = [name for name, prob in sorted_syms[:3] if prob > 0.0]
+            if not promoted:
+                promoted = [name for name, prob in sorted_syms[:3]]
+            active_symptoms = [f"{name} (Promoted)" for name in promoted]
             reconciled_symptoms = True
 
         # --- Fusion gate weights ---
@@ -354,8 +358,8 @@ class OutputLayer:
             clinical_notes="",
             data_source=data_source,
         )
-        partial.recommended_action = self._recommended_action(risk, pred_label, active_symptoms, raw_risk, sev_score)
-        partial.follow_up_priority = self._follow_up_priority(risk, active_symptoms, raw_risk)
+        partial.recommended_action = self._recommended_action(risk, pred_label, detected_symptoms, raw_risk, sev_score)
+        partial.follow_up_priority = self._follow_up_priority(risk, detected_symptoms, raw_risk)
         partial.clinical_notes     = self._clinical_notes(partial, raw_risk, reconciled_symptoms)
         return partial
 
@@ -390,8 +394,9 @@ class OutputLayer:
             risk_counts[r.risk_level] = risk_counts.get(r.risk_level, 0) + 1
             sev_dist[r.severity_category] = sev_dist.get(r.severity_category, 0) + 1
             for sym in r.active_symptoms:
-                if sym in sym_counts:
-                    sym_counts[sym] += 1
+                clean_sym = sym.replace(" (Promoted)", "")
+                if clean_sym in sym_counts:
+                    sym_counts[clean_sym] += 1
             for mod, imp in r.top_features:
                 mod_imp[mod] = mod_imp.get(mod, 0.0) + imp
             for feat, val in r.named_feature_importances.items():
@@ -446,7 +451,8 @@ class OutputLayer:
             "| DSM-5 ACTIVE SYMPTOMS ({})".format(len(r.active_symptoms)).ljust(width) + " |",
         ]
         for sym in r.active_symptoms or ["(none above threshold)"]:
-            score = r.symptom_scores.get(sym, 0.0)
+            clean_sym = sym.replace(" (Promoted)", "")
+            score = r.symptom_scores.get(clean_sym, 0.0)
             lines.append("|   - {:<38} {:5.1%}".format(sym, score).ljust(width) + " |")
 
         lines += [

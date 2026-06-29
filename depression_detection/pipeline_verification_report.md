@@ -57,7 +57,9 @@ Optimal classification thresholds were selected dynamically per split to maximiz
 | **MCC** | 1.0000 | Perfect Classification |
 
 > [!WARNING]  
-> **Evaluation Limitation (Synthetic Data Artifact):** While strict client index-partitioning was implemented (passing `train_data.indices` to client nodes to guarantee zero train-val data leakage), the perfect metrics are **wholly an artifact of the synthetic data generation process**. Non-text modalities (EEG, Wearable, Audio/Video, Clinical, and MFCC) are generated with a label-conditioned mean shift of `0.3 * label`. This makes the classes perfectly linearly separable in representation space. These metrics do *not* reflect real-world clinical performance and should be framed purely as a pipeline integration verification.
+> **Methodological Limitations (Evaluation Leakage & Separability):**
+> 1. **Evaluation Leakage**: Selecting the classification threshold dynamically on the validation set to maximize the F1-score constitutes evaluation leakage and inflates the reported metrics. For clinical deployment, threshold calibration must occur on a separate calibration fold or cross-validation on the training split.
+> 2. **Synthetic Data Artifact**: The perfect metrics are an artifact of the synthetic data generator. Non-text modalities (EEG, Wearable, Audio/Video, Clinical, and MFCC) are generated with a label-conditioned mean shift of `0.3 * label` across multiple dimensions, making the classes perfectly separable in representation space. This serves as a verification of the pipeline implementation but does not represent real-world clinical performance.
 
 ### 3.2 Fairness and Bias Audit
 The system audits demographic fairness across gender and data source using **Equalized Odds Gap (EO-gap)** and **Demographic Parity Gap (DP-gap)**:
@@ -72,9 +74,10 @@ The system audits demographic fairness across gender and data source using **Equ
 ```
 
 > [!IMPORTANT]
-> **Data Representation & Fairness Disclosures:**
-> 1. **EO-Gap = N/A**: The Equalized Odds gap for `gender=male` and `gender=female` subgroups is reported as `N/A`. Because Reddit represents 98.7% of the dataset, the 15% validation split ($n=300$) contains only a few WU3D samples, resulting in **zero positive (depressed) samples** for the male and female subgroups. Since the positive support is zero, the True Positive Rate (TPR) is mathematically undefined, and the EO gap cannot be calculated.
-> 2. **Clinical Limitation**: This severe demographic cohort imbalance is a major safety limitation. A clinical decision system cannot claim fairness or safety across demographic subgroups under such representation disparities. Committing to a balanced cohort collection is a prerequisite for clinical deployment.
+> **Fairness and Demographic Representation Disclosures:**
+> 1. **EO-Gap = N/A**: The Equalized Odds gap for gender subgroups is reported as `N/A`. Because Reddit represents 98.7% of the dataset, the 15% validation split ($n=300$) contains only a few WU3D samples, resulting in **zero positive (depressed) samples** for the male and female subgroups. Since positive support is zero, the TPR is mathematically undefined.
+> 2. **Demographic Parity Disparity**: The bias audit reveals a significant demographic parity gap for gender subgroups (`DP-gap = 0.2109` for male and `0.2891` for female). This is a direct consequence of the extreme data representation imbalance and a major clinical safety limitation.
+> 3. **Leave-One-Dataset-Out (LODO) Caveat**: Cross-dataset validation results (LODO) are omitted/demoted in this evaluation because testing on a handful of synthetic WU3D samples is uninformative due to the predetermined linear separability of synthetic modal features.
 
 ---
 
@@ -109,19 +112,20 @@ To prevent catastrophic false negatives under severe symptoms, the output layer 
 
 ### 5.1 Gating & Consistency Rules
 1.  **Risk Level Capping**: If the model predicts `Normal` but clinical severity is severe, the risk is gated to `Moderate` (avoiding high-risk classification while signaling clinical distress).
-2.  **Follow-up Priority**: Determined as the maximum of gated risk and raw clinical risk (resolving to `Urgent` for severe cases).
-3.  **Severity-Symptom Consistency Reconciliation**: If a patient's severity score is Severe ($\ge 20$) or Moderately Severe ($\ge 15$) but the model's multi-label symptom head detects zero active symptoms, this is an inconsistency. The system programmatically promotes the top 3 highest-probability symptoms to ensure the clinical report is internally consistent, and logs this override.
+2.  **Follow-up Priority**: Driven by the maximum of gated risk and raw clinical risk (resolving to `Urgent` for severe cases based on severity score alone).
+3.  **Severity-Symptom Consistency Reconciliation**: If a patient's severity score is Severe ($\ge 20$) or Moderately Severe ($\ge 15$) but the model detects zero active symptoms, the top 3 highest-probability symptoms are promoted for clinical report consistency and visually tagged with a `(Promoted)` label.
+4.  **Action Isolation**: To prevent false-positive crisis alerts (which erodes patient trust and wastes resources), safety actions (`recommended_action`, `follow_up_priority`) are driven strictly by model-detected symptoms that exceed the `0.45` threshold. Promoted symptoms do *not* escalate crisis response actions; instead, the gated clinician review action and severity-based priority apply.
 
 ### 5.2 Case Study: `PATIENT_00000` Report Details
 The clinical report for `PATIENT_00000` validates the safety gating and consistency overrides under a prediction mismatch:
 
-*   **Model Prediction**: `Normal` (confidence 99.1%)
+*   **Model Prediction**: `Normal` (confidence 99.9%)
 *   **Raw Severity**: `27.0 / 27` (Severe)
 *   **Gated Risk Level**: `Moderate`
-*   **Effective Follow-up Priority**: `Urgent`
-*   **DSM-5 Active Symptoms (3)**: Appetite Change, Irritability, Loneliness (promoted for clinical consistency)
+*   **Effective Follow-up Priority**: `Urgent` (due to severe index score)
+*   **DSM-5 Active Symptoms (3)**: Loneliness (Promoted), Depressed Mood (Promoted), Suicidal Ideation (Promoted)
 *   **Clinical Notes**:
-    > *AI-assisted screening result. Prediction: Normal (confidence 99.1%). PHQ-9 proxy: 27.0 (Severe). Active DSM-5 symptoms: Appetite Change, Irritability, Loneliness. Primary modality: text. Note: Model predicted 'Normal' but rule-based severity suggests 'High' risk; gated final risk level to 'Moderate'. Note: Severity indicates high clinical risk but no symptoms originally exceeded threshold; top-probability symptoms promoted for clinical consistency.*
+    > *AI-assisted screening result. Prediction: Normal (confidence 99.9%). PHQ-9 proxy: 27.0 (Severe). Active DSM-5 symptoms: Loneliness (Promoted), Depressed Mood (Promoted), Suicidal Ideation (Promoted). Primary modality: av. Note: Model predicted 'Normal' but rule-based severity suggests 'High' risk; gated final risk level to 'Moderate'. Note: Severity indicates high clinical risk but no symptoms originally exceeded threshold; top-probability symptoms promoted for clinical consistency. NOTE: This is an AI decision-support tool; clinical judgement must override.*
 *   **Recommended Clinical Guidance**:
     > *Model predicts Normal; clinical severity indicators are Severe. Clinician review recommended before de-escalation.*
 
@@ -130,6 +134,7 @@ The clinical report for `PATIENT_00000` validates the safety gating and consiste
 ## 6. Key Conclusions for Publication
 
 When describing this system in a research paper, frame the findings as follows:
-1.  **Safety Gating**: The implementation of a rule-based clinical override and symptom-severity consistency checks successfully prevents severe symptoms from being de-escalated due to model false negatives.
+1.  **Safety Gating**: A rule-based clinical override and symptom-severity consistency checks prevent severe symptoms from being de-escalated due to model false negatives.
 2.  **DP Disclosures**: The differential privacy component must be presented as a **negative result** and a limitation. Applying standard DP noise to a 3.9M parameter model prevents convergence, while the $1/\sqrt{d}$ scaling heuristic invalidates the privacy guarantee (yielding $\epsilon > 3 \times 10^8$).
-3.  **Metrics Limitations**: Highlight that the perfect F1/AUC scores on synthetic data represent a verification of the integration pipeline rather than proof of classification performance, due to the linearly separable modality shift in the generator.
+3.  **Metrics Limitations**: Emphasize that perfect F1/AUC scores are artifacts of synthetic separability and threshold-tuning on the evaluation split (leakage).
+4.  **Bias Disparity**: Disclose that the model exhibits a significant demographic parity gap (gender groups showing 21-29% DP disparity), driven by cohort representation imbalance..
