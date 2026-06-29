@@ -463,10 +463,25 @@ class OutputLayer:
         if line_.strip("|").strip():
             lines.append(line_.rstrip().ljust(width) + " |")
 
+        action_prefix = "| Action   : "
+        words = r.recommended_action.split()
+        current_line = action_prefix
+        action_lines = []
+        for w in words:
+            if len(current_line) + len(w) + 1 > width:
+                action_lines.append(current_line.rstrip().ljust(width) + " |")
+                current_line = "|            " + w + " "
+            else:
+                current_line += w + " "
+        if current_line.strip("|").strip():
+            action_lines.append(current_line.rstrip().ljust(width) + " |")
+
         lines += [
             "+" + "-" * width + "+",
             "| CLINICAL GUIDANCE".ljust(width) + " |",
-            "| Action   : {}".format(r.recommended_action[:width - 12]).ljust(width) + " |",
+        ]
+        lines.extend(action_lines)
+        lines += [
             "| Priority : {}".format(r.follow_up_priority).ljust(width) + " |",
             "+" + "=" * width + "+",
         ]
