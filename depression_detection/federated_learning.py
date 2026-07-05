@@ -135,7 +135,10 @@ class DifferentialPrivacyMechanism:
         self.clip_norm = clip_norm
         if self.sigma_config is not None:
             self.sigma = self.sigma_config
-            self.epsilon = clip_norm * math.sqrt(2 * math.log(1.25 / self.delta)) / self.sigma
+            if self.sigma == 0.0:
+                self.epsilon = float('inf')
+            else:
+                self.epsilon = clip_norm * math.sqrt(2 * math.log(1.25 / self.delta)) / self.sigma
         elif self.epsilon_config is not None:
             self.epsilon = self.epsilon_config
             self.sigma = clip_norm * math.sqrt(2 * math.log(1.25 / self.delta)) / self.epsilon
@@ -184,19 +187,9 @@ class DifferentialPrivacyMechanism:
     def add_noise(
         self, delta_weights: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Add Gaussian noise calibrated for (epsilon, delta)-DP.
-
-        The noise vector's **total L2 norm** is calibrated to self.sigma, not
-        each element independently.  Naively using std=sigma per parameter
-        produces a noise vector with L2 norm = sigma * sqrt(d), which for a
-        3.9 M-parameter model gives ~9 600 -- completely overwhelming any
-        clipped gradient (norm <= clip_norm = 1.0) and causing NaN weights.
-
-        Per-element std = sigma / sqrt(total_params) ensures:
-            E[||noise||_2] = sigma / sqrt(d) * sqrt(d) = sigma
-        which is the correct noise magnitude for the (epsilon, delta)-DP
-        Gaussian mechanism applied to the full parameter vector.
-        """
+        """Add Gaussian noise calibrated for (epsilon, delta)-DP."""
+        if self.sigma == 0.0:
+            return delta_weights
         total_params = max(sum(v.numel() for v in delta_weights.values()), 1)
         per_elem_std = self.sigma / math.sqrt(total_params)
         return {
@@ -239,18 +232,12 @@ class SecureAggregation:
     @staticmethod
     def apply_masks(
         delta_list: List[Dict[str, torch.Tensor]],
+        node_sizes: Optional[List[int]] = None,
     ) -> List[Dict[str, torch.Tensor]]:
         """Apply pairwise masks to a list of delta-weight dicts.
 
-        Parameters
-        ----------
-        delta_list : list of {param_name: Tensor}
-            One dict per node.  All dicts must share the same keys and shapes.
-
-        Returns
-        -------
-        masked_list : list of {param_name: Tensor}
-            Masked deltas ready for upload.  Sum equals sum of inputs.
+        Scales masks by 1/weight if node_sizes is provided to ensure they cancel out
+        under weighted FedAVG.
         """
         n = len(delta_list)
         if n < 2:
@@ -260,13 +247,19 @@ class SecureAggregation:
         masked = [{k: v.clone() for k, v in d.items()} for d in delta_list]
         keys   = list(delta_list[0].keys())
 
+        if node_sizes is not None:
+            total_n = sum(node_sizes)
+            weights = [max(sz, 1) / max(total_n, 1) for sz in node_sizes]
+        else:
+            weights = [1.0] * n
+
         for i in range(n):
             for j in range(i + 1, n):
                 for k in keys:
                     # Both nodes must have matching shapes (guaranteed by shared architecture)
                     mask = torch.randn_like(delta_list[0][k])
-                    masked[i][k] = masked[i][k] + mask
-                    masked[j][k] = masked[j][k] - mask
+                    masked[i][k] = masked[i][k] + mask / weights[i]
+                    masked[j][k] = masked[j][k] - mask / weights[j]
 
         return masked
 
@@ -603,7 +596,7 @@ class FederatedLearningLayer:
 
         # 2. Secure Aggregation (pairwise masking)
         if self.cfg.use_secure_aggregation and len(privatised_deltas) >= 2:
-            upload_deltas = SecureAggregation.apply_masks(privatised_deltas)
+            upload_deltas = SecureAggregation.apply_masks(privatised_deltas, node_sizes)
         else:
             upload_deltas = privatised_deltas
 
@@ -676,8 +669,9 @@ class FederatedLearningLayer:
         device: torch.device,
         batch_size: int = 16,
         train_indices: Optional[List[int]] = None,
+        allow_train_on_wu3d: bool = False,
     ) -> "FederatedLearningLayer":
-        """Factory: split full_dataset by source (wu3d / reddit / daic) into LocalNodes, skipping wu3d."""
+        """Factory: split full_dataset by source (wu3d / reddit / daic) into LocalNodes."""
         nodes: List[LocalNode] = []
 
         def process_dataset(ds, offset=0):
@@ -691,7 +685,7 @@ class FederatedLearningLayer:
                 records = ds.records
                 sources = sorted(set(r.source for r in records))
                 for src in sources:
-                    if src == "wu3d":
+                    if src == "wu3d" and not allow_train_on_wu3d:
                         print(f"Skipping source '{src}' for Federated Learning training pool (evaluation only)")
                         continue
                     
@@ -725,7 +719,7 @@ class FederatedLearningLayer:
                 else:
                     subset_name = getattr(ds, "source_name", f"dataset_{offset}")
 
-                if subset_name == "wu3d":
+                if subset_name == "wu3d" and not allow_train_on_wu3d:
                     print("Skipping wu3d dataset from training pool.")
                     return
 

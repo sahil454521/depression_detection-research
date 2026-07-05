@@ -237,8 +237,12 @@ def run_layers_1_to_6_pipeline(args) -> dict:
         daic_woz_labels=args.daic_woz_labels,
         max_samples=args.max_samples,
         val_split=args.val_split,
+        test_split=args.test_split,
         batch_size=args.batch_size,
         seed=args.seed,
+        use_class_weights=not args.no_class_weights,
+        allow_train_on_wu3d=args.allow_train_on_wu3d,
+        use_centralized_training=args.centralized,
         # Model
         hidden_dim=args.hidden_dim,
         text_embed_dim=args.text_embed_dim,
@@ -442,8 +446,15 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--max_samples",  type=int,   default=2000,
                        help="Cap total samples for pipeline (0=all). Default 2000.")
     train.add_argument("--val_split",    type=float, default=0.15)
+    train.add_argument("--test_split",   type=float, default=0.15)
     train.add_argument("--batch_size",   type=int,   default=16)
     train.add_argument("--seed",         type=int,   default=42)
+    train.add_argument("--no_class_weights", action="store_true",
+                       help="Disable class weighting for loss calculation.")
+    train.add_argument("--allow_train_on_wu3d", action="store_true",
+                       help="Allow training on wu3d dataset.")
+    train.add_argument("--centralized", action="store_true",
+                       help="Use centralized training instead of federated learning.")
 
     # ---- Model ----
     model = p.add_argument_group("Model")

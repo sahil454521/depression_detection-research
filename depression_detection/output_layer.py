@@ -136,7 +136,7 @@ class OutputLayer:
     def __init__(
         self,
         symptom_threshold: float = 0.5,
-        severity_scale: float = 10.0,
+        severity_scale: float = 1.0,
     ):
         self.symptom_threshold = symptom_threshold
         self.severity_scale = severity_scale
@@ -304,7 +304,10 @@ class OutputLayer:
         reconciled_symptoms = False
         if sev_score >= 15.0 and len(active_symptoms) == 0:
             # Find the top predicted symptoms to reconcile the severe index
-            sorted_syms = sorted(symptom_scores.items(), key=lambda x: -x[1])
+            # Exclude critical self-harm/suicidal symptoms from promotion to avoid clinical false positives
+            exclude_from_promotion = {"Suicidal Ideation", "Self-Harm Ideation"}
+            filtered_scores = {name: prob for name, prob in symptom_scores.items() if name not in exclude_from_promotion}
+            sorted_syms = sorted(filtered_scores.items(), key=lambda x: -x[1])
             # Select symptoms with non-zero probability (or top 3 if all are equal)
             promoted = [name for name, prob in sorted_syms[:3] if prob > 0.0]
             if not promoted:

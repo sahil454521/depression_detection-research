@@ -12,7 +12,7 @@ from torch.autograd import Function
 
 @dataclass
 class FairnessConfig:
-    num_genders: int = 2
+    num_genders: int = 3
     num_age_bins: int = 5
     num_languages: int = 8
     num_cultures: int = 8

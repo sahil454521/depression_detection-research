@@ -257,6 +257,8 @@ class RealDepressionDataset(torch.utils.data.Dataset):
         self.embeddings = embeddings  # shape [N, text_embed_dim]
         self.cfg = cfg
         self._rng = np.random.default_rng(cfg.seed)
+        print("  Precomputing DSM-5 keyword matching vectors...")
+        self.dsm5_vectors = [torch.from_numpy(_dsm5_vector(r.text)) for r in self.records]
 
     # ------------------------------------------------------------------
     @classmethod
@@ -310,22 +312,15 @@ class RealDepressionDataset(torch.utils.data.Dataset):
         dep = sum(r.label for r in all_records)
         print(f"  Depressed: {dep}  |  Normal: {len(all_records) - dep}")
 
-        # ---- Build GoogleNews embeddings ----
-        print("\nBuilding GoogleNews embeddings (streaming binary file)...")
-        tokenized: List[List[str]] = [_tokenize(r.text) for r in all_records]
-        needed_words: set = set()
-        for toks in tokenized:
-            for tok in toks:
-                needed_words.update([tok, tok.lower(), tok.capitalize(), tok.upper()])
-
-        print(f"  Unique token variants needed: {len(needed_words)}")
-        word_vectors, vector_size = _load_googlenews_subset(cfg.google_news_bin, needed_words)
-        print(f"  Loaded {len(word_vectors)} word vectors (dim={vector_size})")
-
-        embeddings = np.stack(
-            [_text_to_googlenews_embedding(toks, word_vectors, vector_size) for toks in tokenized],
-            axis=0,
-        ).astype(np.float32)
+        # ---- Build LSA embeddings from TF-IDF ----
+        print("\nExtracting TF-IDF features and applying TruncatedSVD (LSA) to generate dense text embeddings...")
+        texts = [r.text for r in all_records]
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.decomposition import TruncatedSVD
+        vectorizer = TfidfVectorizer(max_features=25000, ngram_range=(1, 2), stop_words='english', sublinear_tf=True, min_df=2)
+        tfidf = vectorizer.fit_transform(texts)
+        svd = TruncatedSVD(n_components=cfg.text_embed_dim, random_state=cfg.seed)
+        embeddings = svd.fit_transform(tfidf).astype(np.float32)
 
         return cls(all_records, embeddings, cfg)
 
@@ -341,7 +336,7 @@ class RealDepressionDataset(torch.utils.data.Dataset):
         text_emb = torch.from_numpy(self.embeddings[idx])   # [300]
 
         # ---- DSM-5 symptom labels from text keywords ----
-        symptom_labels = torch.from_numpy(_dsm5_vector(rec.text))  # [20]
+        symptom_labels = self.dsm5_vectors[idx]  # [20]
 
         # ---- PHQ-9 severity proxy ----
         # Depressed: 10–27, Normal: 0–9  (crude label-based proxy)
@@ -351,16 +346,17 @@ class RealDepressionDataset(torch.utils.data.Dataset):
         else:
             phq9_score = float(rng_state.integers(0, 10))
 
-        # ---- Synthetic non-text modalities (label-conditioned noise) ----
-        # Depressed samples have slightly elevated mean to give the model a
-        # signal even from random modalities during integration testing.
-        noise_mean = 0.3 * rec.label
-        eeg       = torch.randn(cfg.eeg_time, cfg.eeg_channels).add_(noise_mean)
-        wearable  = torch.randn(cfg.wearable_time, cfg.wearable_dim).add_(noise_mean)
-        mfcc      = torch.randn(cfg.mfcc_time, cfg.mfcc_dim).add_(noise_mean)
-        audio     = torch.randn(cfg.audio_time, cfg.audio_dim).add_(noise_mean)
-        video     = torch.randn(cfg.video_time, cfg.video_dim).add_(noise_mean)
-        clinical  = torch.randn(cfg.clinical_dim).add_(noise_mean)
+        # ---- Synthetic non-text modalities (pure noise, no label signal) ----
+        # These datasets are text-only, so non-text modalities are pure noise.
+        # The model must learn to rely on the real text embeddings for
+        # discrimination.  Previously noise_mean was 0.3*label which leaked
+        # labels into synthetic modalities — that is now fixed.
+        eeg       = torch.randn(cfg.eeg_time, cfg.eeg_channels)
+        wearable  = torch.randn(cfg.wearable_time, cfg.wearable_dim)
+        mfcc      = torch.randn(cfg.mfcc_time, cfg.mfcc_dim)
+        audio     = torch.randn(cfg.audio_time, cfg.audio_dim)
+        video     = torch.randn(cfg.video_time, cfg.video_dim)
+        clinical  = torch.randn(cfg.clinical_dim)
 
         # ---- Sensitive attributes ----
         gender   = torch.tensor([rec.gender], dtype=torch.long)
@@ -538,8 +534,10 @@ class DynamicGatingNetwork(nn.Module):
         features = self.shared(modality_embeddings)
         weight_logits = self.weight_head(features).squeeze(-1)
         reliability = torch.sigmoid(self.reliability_head(features).squeeze(-1))
-        combined_logits = weight_logits + torch.log(reliability.clamp(min=1e-6))
-        weights = torch.softmax(combined_logits, dim=1)
+        combined_logits = weight_logits + torch.log(reliability.clamp(min=1e-2))
+        # Apply temperature scaling to prevent softmax saturation/modality collapse
+        temperature = 3.0
+        weights = torch.softmax(combined_logits / temperature, dim=1)
         return weights, reliability
 
 

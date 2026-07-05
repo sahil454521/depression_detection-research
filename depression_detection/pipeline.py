@@ -29,6 +29,7 @@ or call PipelineRunner programmatically from another script.
 from __future__ import annotations
 
 import copy
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,8 +75,12 @@ class PipelineConfig:
     daic_woz_labels:  str = "daic-woz/labels.csv"
     max_samples:      int = 2000
     val_split:        float = 0.15
+    test_split:       float = 0.15
     batch_size:       int = 16
     seed:             int = 42
+    use_class_weights:bool = True
+    allow_train_on_wu3d:bool = False
+    use_centralized_training:bool = False
 
     # ---- Model ----
     hidden_dim:       int = 256
@@ -172,13 +177,39 @@ class RetrainLoop:
                 f"{'=' * 60}"
             )
 
-            # --- FL training ---
-            fl_rounds = self.fl_rounds * (1 + attempt // 2)  # ramp up rounds on failure
-            fl_history = self.fl_layer.run(
-                model=model,
-                prediction_config=prediction_config,
-                num_rounds=fl_rounds,
-            )
+            # Check for centralized training option
+            if getattr(self.fl_layer, "use_centralized_training", False):
+                from torch.utils.data import ConcatDataset, DataLoader
+                from multimodal_model import train_one_epoch
+                print(f"  --- Running Centralized Training ---")
+                train_datasets = [node.dataset for node in self.fl_layer.nodes]
+                combined_train_dataset = ConcatDataset(train_datasets)
+                train_loader = DataLoader(
+                    combined_train_dataset,
+                    batch_size=self.fl_layer.nodes[0].loader.batch_size,
+                    shuffle=True,
+                    collate_fn=self.fl_layer.nodes[0].loader.collate_fn,
+                )
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+                fl_rounds = self.fl_rounds * (1 + attempt // 2)
+                total_epochs = fl_rounds * self.fl_layer.cfg.local_epochs
+                for epoch in range(total_epochs):
+                    loss = train_one_epoch(
+                        model=model,
+                        loader=train_loader,
+                        optimizer=optimizer,
+                        prediction_config=prediction_config,
+                        device=device,
+                    )
+                    print(f"  Centralized Epoch {epoch+1:02d}/{total_epochs} | Loss: {loss:.4f}")
+            else:
+                # --- FL training ---
+                fl_rounds = self.fl_rounds * (1 + attempt // 2)  # ramp up rounds on failure
+                fl_history = self.fl_layer.run(
+                    model=model,
+                    prediction_config=prediction_config,
+                    num_rounds=fl_rounds,
+                )
 
             # --- Validation ---
             report = self.val_layer.validate(
@@ -328,7 +359,7 @@ class DepressionDetectionPipeline:
         max_reports: int = 50,
     ) -> List[PatientReport]:
         """Run model on loader, generate PatientReports."""
-        output_layer = OutputLayer(symptom_threshold=0.45, severity_scale=8.0)
+        output_layer = OutputLayer(symptom_threshold=0.45, severity_scale=1.0)
         reports: List[PatientReport] = []
         model.eval()
 
@@ -397,32 +428,47 @@ class DepressionDetectionPipeline:
         cfg = self.cfg
         os.makedirs(cfg.output_dir, exist_ok=True)
 
-        # ---- 1. Datasets ----
+        # ---- 1. Datasets (3-way split: train / val / test) ----
         full_dataset = self._build_dataset()
+        test_size  = max(1, int(len(full_dataset) * cfg.test_split))
         val_size   = max(1, int(len(full_dataset) * cfg.val_split))
-        train_size = len(full_dataset) - val_size
-        train_data, val_data = torch.utils.data.random_split(
+        train_size = len(full_dataset) - val_size - test_size
+        train_data, val_data, test_data = torch.utils.data.random_split(
             full_dataset,
-            [train_size, val_size],
+            [train_size, val_size, test_size],
             generator=torch.Generator().manual_seed(cfg.seed),
         )
-        print("\nTrain: {:,}  |  Val: {:,}".format(train_size, val_size))
+        print("\nTrain: {:,}  |  Val: {:,}  |  Test: {:,} (held-out)".format(
+            train_size, val_size, test_size))
+
+        # Save test indices so check_unseen.py can load the exact held-out set
+        test_indices_path = os.path.join(cfg.output_dir, "test_indices.json")
+        json.dump({
+            "indices": test_data.indices,
+            "seed": cfg.seed,
+            "total_samples": len(full_dataset),
+            "test_size": test_size,
+        }, open(test_indices_path, "w"))
+        print("Test indices saved: {}".format(test_indices_path))
 
         val_loader = DataLoader(
             val_data, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch
         )
 
-        # ---- 1b. Class Weights ----
-        train_loader_temp = DataLoader(train_data, batch_size=256, shuffle=False, collate_fn=collate_batch)
-        counts = {0: 0, 1: 0}
-        for b in train_loader_temp:
-            for l in b["label"].long().view(-1).tolist():
-                counts[l] += 1
-        total = counts[0] + counts[1]
-        w0 = total / (2.0 * max(counts[0], 1))
-        w1 = total / (2.0 * max(counts[1], 1))
-        class_weights = [w0, w1]
-        print("Class weights injected: Normal={:.4f}, Depressed={:.4f}".format(w0, w1))
+        if cfg.use_class_weights:
+            train_loader_temp = DataLoader(train_data, batch_size=256, shuffle=False, collate_fn=collate_batch)
+            counts = {0: 0, 1: 0}
+            for b in train_loader_temp:
+                for l in b["label"].long().view(-1).tolist():
+                    counts[l] += 1
+            total = counts[0] + counts[1]
+            w0 = total / (2.0 * max(counts[0], 1))
+            w1 = total / (2.0 * max(counts[1], 1))
+            class_weights = [w0, w1]
+            print("Class weights injected: Normal={:.4f}, Depressed={:.4f}".format(w0, w1))
+        else:
+            class_weights = None
+            print("Class weights disabled (uniform weighting [1.0, 1.0] used).")
 
         # ---- 2. Model ----
         # Use self._ds_cfg (set in _build_dataset) to get architecture parameters.
@@ -459,7 +505,9 @@ class DepressionDetectionPipeline:
             device=self.device,
             batch_size=cfg.batch_size,
             train_indices=train_data.indices,
+            allow_train_on_wu3d=cfg.allow_train_on_wu3d,
         )
+        fl_layer.use_centralized_training = cfg.use_centralized_training
 
         # ---- 4. Validation Layer ----
         val_cfg = ValidationConfig(
@@ -506,13 +554,14 @@ class DepressionDetectionPipeline:
             max_reports=min(200, val_size),
         )
 
-        output_layer = OutputLayer(symptom_threshold=0.45, severity_scale=8.0)
+        output_layer = OutputLayer(symptom_threshold=0.45, severity_scale=1.0)
         dashboard = output_layer.generate_dashboard(patient_reports)
 
         if cfg.print_reports:
             print("\n" + output_layer.format_dashboard(dashboard))
 
         # ---- 8. Save artefacts ----
+        thresh = val_report.best_threshold if val_report else 0.5
         if cfg.save_reports and patient_reports:
             ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             path = os.path.join(cfg.output_dir, "reports_{}.json".format(ts))
@@ -522,6 +571,55 @@ class DepressionDetectionPipeline:
             ckpt = os.path.join(cfg.output_dir, "model_{}.pt".format(ts))
             torch.save(model.state_dict(), ckpt)
             print("Model checkpoint saved: {}".format(ckpt))
+            # Update test_indices.json with the optimal threshold
+            try:
+                test_info = json.load(open(test_indices_path, "r"))
+                test_info["best_threshold"] = thresh
+                json.dump(test_info, open(test_indices_path, "w"))
+            except Exception as e:
+                print("Failed to save optimal threshold to test_indices.json: {}".format(e))
+        # ---- 9. Held-out test set evaluation ----
+        print("\n=== Held-Out Test Set Evaluation ===")
+        test_loader = DataLoader(
+            test_data, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch
+        )
+        model.eval()
+        test_correct = 0
+        test_total   = 0
+        test_tp = test_tn = test_fp = test_fn = 0
+        print("  Using optimal decision threshold from validation: {:.2f}".format(thresh))
+        with torch.no_grad():
+            for batch in test_loader:
+                batch_dev = {k: v.to(self.device) for k, v in batch.items()}
+                out = model(
+                    text_input=batch_dev["text_emb"],
+                    eeg=batch_dev["eeg"],
+                    wearable=batch_dev["wearable"],
+                    audio=batch_dev["audio"],
+                    video=batch_dev["video"],
+                    clinical=batch_dev["clinical"],
+                    mfcc=batch_dev.get("mfcc"),
+                    explain=False,
+                )
+                preds  = (out["binary_probs"][:, 1] >= thresh).long()
+                labels = batch_dev["label"].view(-1)
+                test_correct += (preds == labels).sum().item()
+                test_total   += preds.numel()
+                test_tp += ((preds == 1) & (labels == 1)).sum().item()
+                test_tn += ((preds == 0) & (labels == 0)).sum().item()
+                test_fp += ((preds == 1) & (labels == 0)).sum().item()
+                test_fn += ((preds == 0) & (labels == 1)).sum().item()
+
+        test_acc = test_correct / max(test_total, 1)
+        test_prec = test_tp / max(test_tp + test_fp, 1)
+        test_rec  = test_tp / max(test_tp + test_fn, 1)
+        test_f1   = 2 * test_prec * test_rec / max(test_prec + test_rec, 1e-8)
+        print("  Test samples:   {:,}".format(test_total))
+        print("  Test Accuracy:  {:.4f}".format(test_acc))
+        print("  Test Precision: {:.4f}".format(test_prec))
+        print("  Test Recall:    {:.4f}".format(test_rec))
+        print("  Test F1:        {:.4f}".format(test_f1))
+        print("  Confusion: TP={} TN={} FP={} FN={}".format(test_tp, test_tn, test_fp, test_fn))
 
         print("\n=== Pipeline complete ===")
         return {
@@ -529,6 +627,14 @@ class DepressionDetectionPipeline:
             "validation_report": val_report,
             "patient_reports":   patient_reports,
             "dashboard":         dashboard,
+            "test_metrics": {
+                "accuracy":  test_acc,
+                "precision": test_prec,
+                "recall":    test_rec,
+                "f1":        test_f1,
+                "tp": test_tp, "tn": test_tn, "fp": test_fp, "fn": test_fn,
+                "total":     test_total,
+            },
         }
 
 

@@ -116,6 +116,7 @@ class ValidationReport:
     lodo_avg_f1: float = 0.0
     lodo_avg_auc: float = 0.0
     retrain_needed: bool = False
+    best_threshold: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +779,7 @@ class ValidationLayer:
             lodo_avg_f1=round(lodo_avg_f1, 4),
             lodo_avg_auc=round(lodo_avg_auc, 4),
             retrain_needed=retrain,
+            best_threshold=best_thresh,
         )
 
     # ------------------------------------------------------------------

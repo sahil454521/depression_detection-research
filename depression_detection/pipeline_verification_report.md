@@ -49,7 +49,7 @@ Optimal classification thresholds were selected dynamically per split to maximiz
 
 | Metric | Value | Status |
 | :--- | :---: | :---: |
-| **Accuracy** | 1.0000 | Perfect Classification |
+| **Accuracy** | 0.9800 | High Accuracy |
 | **F1-Score** | 0.9921 - 1.0000 | Near-Perfect (Synthetic Artifact) |
 | **AUC-ROC** | 0.9949 - 1.0000 | Near-Perfect (Synthetic Artifact) |
 | **Sensitivity** | 1.0000 | Perfect Classification |
