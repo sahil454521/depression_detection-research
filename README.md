@@ -44,8 +44,6 @@ The honest number is 91.24%. Text features moved from averaged Word2Vec vectors 
 
 ## Architecture
 
-<img src="depdetec.drawio.png" alt="PPEMDD system diagram" width="420" align="right">
-
 | Layer | What it does | Where |
 |---|---|---|
 | 0 | Text features: sentiment, LDA topics, DSM-5 keyword counts, embeddings | `text_feature_extraction.py` |
@@ -60,7 +58,11 @@ The honest number is 91.24%. Text features moved from averaged Word2Vec vectors 
 
 Fairness is handled by adversarial debiasing: a gradient reversal layer feeds gender and language/source discriminators, removing those signals from the fused representation.
 
-<br clear="right">
+<details>
+<summary><b>Full system diagram</b></summary>
+<br>
+<img src="depdetec.drawio.png" alt="PPEMDD system diagram, all layers" width="100%">
+</details>
 
 ## Run it
 
